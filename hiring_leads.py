@@ -28,6 +28,8 @@ PAGES = int(os.getenv("PAGES", "2"))
 KEYWORDS = [k.strip() for k in os.getenv(
     "KEYWORDS", "marketing,designer,developer,sales,manager").split(",") if k.strip()]
 EXCLUDE_RECRUITERS = os.getenv("EXCLUDE_RECRUITERS", "1") == "1"
+REMOTE_FOCUS = os.getenv("REMOTE_FOCUS", "1") == "1"  # 1 = search remote roles first
+REMOTE_ONLY = os.getenv("REMOTE_ONLY", "0") == "1"    # 1 = drop anything not clearly remote
 
 # API keys (set as environment variables, see README)
 JOOBLE_KEY = os.getenv("JOOBLE_KEY", "")
@@ -45,6 +47,8 @@ COUNTRIES = {
     "France":         {"adzuna": "fr", "jooble": "France"},
     "Germany":        {"adzuna": "de", "jooble": "Germany"},
     "Canada":         {"adzuna": "ca", "jooble": "Canada"},
+    # Remote-only job board, companies hiring worldwide (no API key needed)
+    "Remote (Worldwide)": {"remotive": True},
 }
 
 RECRUITER_WORDS = ("recruit", "staffing", "talent", "resourc", "headhunt", "personnel",
@@ -82,6 +86,13 @@ def is_recruiter(name):
     return EXCLUDE_RECRUITERS and any(w in low for w in RECRUITER_WORDS)
 
 
+def is_remote(*texts):
+    blob = " ".join(t for t in texts if t).lower()
+    return any(w in blob for w in ("remote", "work from home", "work-from-home",
+                                   "télétravail", "teletravail", "home office",
+                                   "anywhere", "hybrid"))
+
+
 # ----------------------------- SOURCES --------------------------------------
 def from_jooble(country, loc, kw, page):
     if not JOOBLE_KEY:
@@ -95,7 +106,9 @@ def from_jooble(country, loc, kw, page):
         return []
     return [dict(company=j.get("company", "").strip(), role=j.get("title", ""),
                  url=j.get("link", ""), posted=parse_date(j.get("updated")),
-                 country=country, source="Jooble") for j in jobs]
+                 country=country, source="Jooble",
+                 remote=is_remote(j.get("title"), j.get("location"), j.get("snippet"))
+                 ) for j in jobs]
 
 
 def from_adzuna(country, code, kw, page):
@@ -113,7 +126,9 @@ def from_adzuna(country, code, kw, page):
         return []
     return [dict(company=(j.get("company") or {}).get("display_name", "").strip(),
                  role=j.get("title", ""), url=j.get("redirect_url", ""),
-                 posted=parse_date(j.get("created")), country=country, source="Adzuna")
+                 posted=parse_date(j.get("created")), country=country, source="Adzuna",
+                 remote=is_remote(j.get("title"), (j.get("location") or {}).get("display_name"),
+                                  j.get("description")))
             for j in res]
 
 
@@ -137,8 +152,31 @@ def from_reed(country, kw, page):
         except Exception:
             pass
         out.append(dict(company=j.get("employerName", "").strip(), role=j.get("jobTitle", ""),
-                        url=j.get("jobUrl", ""), posted=d, country=country, source="Reed"))
+                        url=j.get("jobUrl", ""), posted=d, country=country, source="Reed",
+                        remote=is_remote(j.get("jobTitle"), j.get("locationName"),
+                                         j.get("jobDescription"))))
     return out
+
+
+def from_remotive(country):
+    """Remote-only jobs from Remotive (free, no key). One call per run on purpose."""
+    try:
+        r = requests.get("https://remotive.com/api/remote-jobs", params={"limit": 300},
+                         headers=UA, timeout=30)
+        jobs = r.json().get("jobs", [])
+    except Exception as e:
+        print(f"  remotive: {e}")
+        return []
+    out = []
+    for j in jobs:
+        out.append(dict(company=j.get("company_name", "").strip(), role=j.get("title", ""),
+                        url=j.get("url", ""), posted=parse_date(j.get("publication_date")),
+                        country=country, source="Remotive", remote=True,
+                        tags=" ".join(j.get("tags") or []) + " " + (j.get("category") or "")))
+    # prefer roles matching your keywords, but never return an empty list
+    kws = [k.lower() for k in KEYWORDS]
+    matched = [o for o in out if any(k in (o["role"] + " " + o["tags"]).lower() for k in kws)]
+    return matched if len(matched) >= 15 else out
 
 
 # --------------------------- VERIFICATION -----------------------------------
@@ -209,9 +247,36 @@ def main():
                    if (parse_date(v) or datetime.min.replace(tzinfo=timezone.utc)) > cutoff}
 
     pool = {}  # (country, normname) -> record
+
+    def ingest(country, jobs):
+        for j in jobs:
+            n = norm(j["company"])
+            if not n or len(n) < 3 or n in seen_recent or is_recruiter(j["company"]):
+                continue
+            if not fresh(j["posted"]):
+                continue
+            if REMOTE_ONLY and not j.get("remote"):
+                continue
+            key = (country, n)
+            if key in pool:
+                pool[key]["roles"].add(j["role"])
+                pool[key]["sources"].add(j["source"])
+                pool[key]["remote"] = pool[key]["remote"] or j.get("remote", False)
+            else:
+                pool[key] = dict(j, roles={j["role"]}, sources={j["source"]},
+                                 remote=j.get("remote", False))
+
+    # remote-flavoured searches first, then the normal ones
+    terms = ([f"remote {k}" for k in KEYWORDS] + KEYWORDS) if REMOTE_FOCUS else KEYWORDS
+    if REMOTE_ONLY:
+        terms = [f"remote {k}" for k in KEYWORDS]
+
     for country, cfg in COUNTRIES.items():
         print(f"Collecting {country}...")
-        for kw in KEYWORDS:
+        if cfg.get("remotive"):
+            ingest(country, from_remotive(country))
+            continue
+        for kw in terms:
             for page in range(1, PAGES + 1):
                 jobs = []
                 if "jooble" in cfg:
@@ -220,30 +285,17 @@ def main():
                     jobs += from_adzuna(country, cfg["adzuna"], kw, page)
                 if cfg.get("reed"):
                     jobs += from_reed(country, kw, page)
-                for j in jobs:
-                    n = norm(j["company"])
-                    if not n or len(n) < 3 or n in seen_recent or is_recruiter(j["company"]):
-                        continue
-                    if not fresh(j["posted"]):
-                        continue
-                    key = (country, n)
-                    if key in pool:
-                        pool[key]["roles"].add(j["role"])
-                        pool[key]["sources"].add(j["source"])
-                    else:
-                        pool[key] = dict(j, roles={j["role"]}, sources={j["source"]})
+                ingest(country, jobs)
                 time.sleep(0.3)
 
     # round-robin across countries so one country doesn't eat the whole list
     by_country = {}
+    floor = datetime.min.replace(tzinfo=timezone.utc)
     for rec in pool.values():
         by_country.setdefault(rec["country"], []).append(rec)
     for lst in by_country.values():
-        lst.sort(key=lambda r: (-len(r["sources"]),
-                                r["posted"] or datetime.min.replace(tzinfo=timezone.utc)),
-                 reverse=False)
-        lst.sort(key=lambda r: (len(r["sources"]),
-                                r["posted"] or datetime.min.replace(tzinfo=timezone.utc)),
+        # remote first, then seen on more boards, then newest
+        lst.sort(key=lambda r: (r["remote"], len(r["sources"]), r["posted"] or floor),
                  reverse=True)
 
     results, queues = [], {c: list(v) for c, v in by_country.items()}
@@ -269,6 +321,7 @@ def main():
             li, li_note = linkedin_link(rec["company"])
             results.append({
                 "Company": rec["company"], "Country": c,
+                "Remote?": "Yes" if rec["remote"] else "Not stated",
                 "Roles hiring": " | ".join(sorted(rec["roles"]))[:200],
                 "Job link": rec["url"],
                 "Posted": rec["posted"].strftime("%Y-%m-%d") if rec["posted"] else "unknown",
@@ -294,7 +347,7 @@ def main():
         ws.append(fields)
         for r in results:
             ws.append([r[k] for k in fields])
-        for col, width in zip("ABCDEFGH", (30, 14, 45, 50, 12, 55, 30, 45)):
+        for col, width in zip("ABCDEFGHI", (30, 18, 12, 45, 50, 12, 55, 30, 45)):
             ws.column_dimensions[col].width = width
         wb.save(base + ".xlsx")
     except ImportError:
