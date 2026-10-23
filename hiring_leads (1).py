@@ -4,7 +4,7 @@ Daily hiring-companies generator.
 
 Pulls live job postings from legit job APIs (Jooble, Adzuna, Reed), keeps one row per
 company, verifies each one, skips companies you already got in the last 30 days, and
-saves 40-60 fresh companies to CSV + XLSX every run.
+saves 40-80 fresh companies to CSV + XLSX every run.
 
 Setup: see README.md. Needs: pip install requests openpyxl
 """
@@ -23,8 +23,8 @@ import requests
 # ----------------------------- CONFIG ---------------------------------------
 TARGET = int(os.getenv("TARGET", "50"))              # companies per run (40-60)
 MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "14"))  # only jobs posted within this window
-SKIP_SEEN_DAYS = int(os.getenv("SKIP_SEEN_DAYS", "30"))
-PAGES = int(os.getenv("PAGES", "2"))
+SKIP_SEEN_DAYS = int(os.getenv("SKIP_SEEN_DAYS", "3650"))  # ~10 years = never repeat a company
+PAGES = int(os.getenv("PAGES", "3"))
 KEYWORDS = [k.strip() for k in os.getenv(
     "KEYWORDS", "marketing,designer,developer,sales,manager").split(",") if k.strip()]
 EXCLUDE_RECRUITERS = os.getenv("EXCLUDE_RECRUITERS", "1") == "1"
@@ -62,7 +62,8 @@ UA = {"User-Agent": "Mozilla/5.0 (compatible; HiringLeads/1.0)"}
 
 def norm(name):
     n = re.sub(r"[^a-z0-9 ]", "", name.lower())
-    n = re.sub(r"\b(ltd|limited|llc|inc|plc|sarl|sa|gmbh|fze|fzco|co)\b", "", n)
+    n = re.sub(r"\b(ltd|limited|llc|inc|plc|sarl|sa|gmbh|fze|fzco|co|the|group|uk|corp|corporation)\b",
+               "", n)
     return re.sub(r"\s+", " ", n).strip()
 
 
@@ -299,6 +300,7 @@ def main():
                  reverse=True)
 
     results, queues = [], {c: list(v) for c, v in by_country.items()}
+    used = set()  # a company can only appear once per file, even if it hires in several countries
     print(f"Pool: {sum(len(v) for v in queues.values())} candidate companies. Verifying...")
     while len(results) < TARGET and any(queues.values()):
         for c in list(queues):
@@ -307,6 +309,8 @@ def main():
             if not queues[c]:
                 continue
             rec = queues[c].pop(0)
+            if norm(rec["company"]) in used:
+                continue
             live = job_is_live(rec["url"])
             if live == "dead":
                 continue
@@ -319,6 +323,7 @@ def main():
             if len(rec["sources"]) > 1:
                 verify.append("on " + " + ".join(sorted(rec["sources"])))
             li, li_note = linkedin_link(rec["company"])
+            used.add(norm(rec["company"]))
             results.append({
                 "Company": rec["company"], "Country": c,
                 "Remote?": "Yes" if rec["remote"] else "Not stated",
