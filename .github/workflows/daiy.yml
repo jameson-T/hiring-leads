@@ -1,0 +1,47 @@
+name: Daily hiring leads
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 6:00 UTC = 7:00 AM Nigeria time, every day
+  workflow_dispatch:       # lets you also run it by hand with a button
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests openpyxl
+
+      - name: Generate today's companies
+        env:
+          JOOBLE_KEY: ${{ secrets.JOOBLE_KEY }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          REED_KEY: ${{ secrets.REED_KEY }}
+          COMPANIES_HOUSE_KEY: ${{ secrets.COMPANIES_HOUSE_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          KEYWORDS: "web designer,social media,marketing,developer,sales"
+          TARGET: "50"
+        run: python hiring_leads.py
+
+      - name: Save results and history to the repo
+        run: |
+          git config user.name "hiring-bot"
+          git config user.email "hiring-bot@users.noreply.github.com"
+          git add hiring_companies_*.xlsx hiring_companies_*.csv seen.json
+          git commit -m "Hiring leads $(date -u +%F)" || echo "nothing to commit"
+          git pull --rebase
+          git push
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiring-companies
+          path: hiring_companies_*.xlsx
