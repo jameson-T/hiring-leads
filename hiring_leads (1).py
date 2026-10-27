@@ -231,11 +231,26 @@ def linkedin_link(name):
 
 # ------------------------------ MAIN ----------------------------------------
 def load_history():
+    """Every company ever given to you: seen.json PLUS every old hiring_companies_*.csv file
+    in the folder. Even if seen.json gets lost, old files still block repeats."""
+    import glob
+    h = {}
     try:
         with open(HISTORY) as f:
-            return json.load(f)
+            h = json.load(f)
     except Exception:
-        return {}
+        pass
+    now = datetime.now(timezone.utc).isoformat()
+    for path in glob.glob(os.path.join(HERE, "hiring_companies_*.csv")):
+        try:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    n = norm(row.get("Company", ""))
+                    if n:
+                        h.setdefault(n, now)
+        except Exception:
+            pass
+    return h
 
 
 def main():
@@ -301,6 +316,7 @@ def main():
 
     results, queues = [], {c: list(v) for c, v in by_country.items()}
     used = set()  # a company can only appear once per file, even if it hires in several countries
+    used_urls = set()
     print(f"Pool: {sum(len(v) for v in queues.values())} candidate companies. Verifying...")
     while len(results) < TARGET and any(queues.values()):
         for c in list(queues):
@@ -309,7 +325,7 @@ def main():
             if not queues[c]:
                 continue
             rec = queues[c].pop(0)
-            if norm(rec["company"]) in used:
+            if norm(rec["company"]) in used or rec["url"] in used_urls:
                 continue
             live = job_is_live(rec["url"])
             if live == "dead":
@@ -324,6 +340,7 @@ def main():
                 verify.append("on " + " + ".join(sorted(rec["sources"])))
             li, li_note = linkedin_link(rec["company"])
             used.add(norm(rec["company"]))
+            used_urls.add(rec["url"])
             results.append({
                 "Company": rec["company"], "Country": c,
                 "Remote?": "Yes" if rec["remote"] else "Not stated",
@@ -335,7 +352,14 @@ def main():
             })
 
     if not results:
-        sys.exit("Nothing came back. Check your API keys and internet connection.")
+        sys.exit("No NEW companies found today (everything returned was already given to you). "
+                 "Add more KEYWORDS or more API keys and run again.")
+
+    # final safety net: no duplicate company can ever be written
+    assert len({norm(r["Company"]) for r in results}) == len(results), "duplicate company!"
+    if len(results) < 40:
+        print(f"Note: only {len(results)} brand-new companies today. Add more KEYWORDS/API keys "
+              f"to get 40-60.")
 
     stamp = datetime.now().strftime("%Y-%m-%d")
     base = os.path.join(HERE, f"hiring_companies_{stamp}")
