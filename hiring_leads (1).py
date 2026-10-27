@@ -4,7 +4,7 @@ Daily hiring-companies generator.
 
 Pulls live job postings from legit job APIs (Jooble, Adzuna, Reed), keeps one row per
 company, verifies each one, skips companies you already got in the last 30 days, and
-saves 40-80 fresh companies to CSV + XLSX every run.
+saves 40-60 fresh companies to CSV + XLSX every run.
 
 Setup: see README.md. Needs: pip install requests openpyxl
 """
