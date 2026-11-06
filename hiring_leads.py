@@ -29,7 +29,8 @@ PAGES = int(os.getenv("PAGES", "3"))
 KEYWORDS = [k.strip() for k in os.getenv(
     "KEYWORDS", "marketing,designer,developer,sales,manager").split(",") if k.strip()]
 EXCLUDE_RECRUITERS = os.getenv("EXCLUDE_RECRUITERS", "1") == "1"
-REMOTE_FOCUS = os.getenv("REMOTE_FOCUS", "1") == "1"  # 1 = search remote roles first
+REMOTE_FOCUS = os.getenv("REMOTE_FOCUS", "0") == "1"  # 1 = also search "remote X" in each country
+#   (default off: those searches return worldwide remote jobs. Remote jobs come from Remotive.)
 REMOTE_ONLY = os.getenv("REMOTE_ONLY", "0") == "1"    # 1 = drop anything not clearly remote
 
 # API keys (set as environment variables, see README)
@@ -44,7 +45,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")                  # optional, finds re
 COUNTRIES = {
     "United Kingdom": {"adzuna": "gb", "reed": True, "jooble": "United Kingdom"},
     "UAE":            {"jooble": "United Arab Emirates"},
-    "Lebanon":        {"jooble": "Lebanon"},
+    "Lebanon":        {"jooble": "Beirut, Lebanon"},   # plain "Lebanon" matches US towns
     "France":         {"adzuna": "fr", "jooble": "France"},
     "Germany":        {"adzuna": "de", "jooble": "Germany"},
     "Canada":         {"adzuna": "ca", "jooble": "Canada"},
@@ -118,6 +119,34 @@ def is_recruiter(name):
     return EXCLUDE_RECRUITERS and any(w in low for w in RECRUITER_WORDS)
 
 
+# A job only counts for UAE / Lebanon if its real location says so (blocks US towns named
+# Lebanon, worldwide remote jobs, etc.). Empty location = allowed.
+LOCATION_MARKERS = {
+    "UAE": ("uae", "emirates", "dubai", "abu dhabi", "sharjah", "ajman", "ras al khaimah",
+            "fujairah", "umm al quwain", "al ain", "jebel ali", "difc", "مارات", "دبي", "أبوظبي"),
+    "Lebanon": ("lebanon", "beirut", "tripoli", "jounieh", "sidon", "saida", "byblos", "jbeil",
+                "zahle", "tyre", "baabda", "لبنان", "بيروت"),
+}
+
+
+US_HINTS = ("united states", "usa", ", us", "ohio", "tennessee", "pennsylvania", "oregon",
+            "kentucky", "missouri", "new hampshire", "indiana", "virginia", "illinois", "texas")
+
+
+def in_country(country, loc):
+    for key, marks in LOCATION_MARKERS.items():
+        if country.startswith(key):
+            raw = (loc or "").strip()
+            low = raw.lower()
+            if not low:
+                return True
+            if key == "Lebanon" and (re.search(r",\s*[A-Z]{2}\b", raw)
+                                     or any(h in low for h in US_HINTS)):
+                return False          # Lebanon, OH / TN / PA... are US towns
+            return any(m in low for m in marks)
+    return True
+
+
 def is_b2c(company, role):
     blob = f"{company} {role}".lower()
     return any(w in blob for w in B2C_WORDS)
@@ -155,6 +184,7 @@ def from_jooble(country, loc, kw, page):
     return [dict(company=j.get("company", "").strip(), role=j.get("title", ""),
                  url=j.get("link", ""), posted=parse_date(j.get("updated")),
                  country=country, source="Jooble", ptext=j.get("snippet"),
+                 loc=j.get("location") or "",
                  remote=is_remote(j.get("title"), j.get("location"), j.get("snippet"))
                  ) for j in jobs]
 
@@ -260,6 +290,7 @@ def from_jsearch(country, where, kw):
             posted=parse_date(j.get("job_posted_at_datetime_utc")), country=country,
             source="JSearch",
             ptext=f"{j.get('job_employment_type') or ''} {(j.get('job_description') or '')[:600]}",
+            loc=f"{j.get('job_city') or ''} {j.get('job_state') or ''} {j.get('job_country') or ''}",
             remote=bool(j.get("job_is_remote")), trusted=True))
     return out
 
@@ -412,6 +443,9 @@ def main():
                 continue
             if n in seen_recent:
                 DIAG["dropped: already given to you before"] += 1
+                continue
+            if not in_country(country, j.get("loc")):
+                DIAG["dropped: job not located in that country"] += 1
                 continue
             if is_recruiter(j["company"]):
                 DIAG["dropped: recruiter/agency"] += 1
