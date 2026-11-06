@@ -64,10 +64,10 @@ if UAE_MODE:
                     "web developer", "graphic designer", "social media", "seo",
                     "video editor", "branding", "crm", "erp", "business development"]
     COUNTRIES = {
-        "UAE - Dubai":     {"jooble": "Dubai"},
-        "UAE - Abu Dhabi": {"jooble": "Abu Dhabi"},
-        "UAE - Sharjah":   {"jooble": "Sharjah"},
-        "UAE - Other":     {"jooble": "United Arab Emirates"},
+        "UAE - Dubai":     {"jooble": "Dubai", "jsearch": "Dubai, United Arab Emirates"},
+        "UAE - Abu Dhabi": {"jooble": "Abu Dhabi", "jsearch": "Abu Dhabi, United Arab Emirates"},
+        "UAE - Sharjah":   {"jooble": "Sharjah", "jsearch": "Sharjah, United Arab Emirates"},
+        "UAE - Other":     {"jooble": "United Arab Emirates", "jsearch": "United Arab Emirates"},
     }
 
 # Obvious consumer-facing / non-B2B jobs get dropped in UAE mode
@@ -98,8 +98,12 @@ def parse_date(s):
     if not s:
         return None
     try:
-        d = datetime.fromisoformat(str(s).replace("Z", "+00:00")[:25])
-        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        # accepts 2026-11-05, 2026-11-05T10:00:00Z, ...00.000Z, ...00.0000000, ...+01:00
+        mt = re.match(r"(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}:\d{2}))?", str(s).strip())
+        if not mt:
+            return None
+        stamp = mt.group(1) + " " + (mt.group(2) or "00:00:00")
+        return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
@@ -223,6 +227,43 @@ def from_remotive(country):
     return matched if len(matched) >= 15 else out
 
 
+def from_jsearch(country, where, kw):
+    """JSearch (RapidAPI) = Google for Jobs listings. Google removes closed jobs, so these are
+    live listings by design. Limited by your RapidAPI quota, so only a few calls per city."""
+    if not RAPIDAPI_KEY:
+        return []
+    ck = f"jsearch_calls_{country}"
+    if DIAG[ck] >= JSEARCH_PER_CITY:
+        return []
+    DIAG[ck] += 1
+    try:
+        r = requests.get("https://jsearch.p.rapidapi.com/search",
+                         headers={"X-RapidAPI-Key": RAPIDAPI_KEY,
+                                  "X-RapidAPI-Host": "jsearch.p.rapidapi.com"},
+                         params={"query": f"{kw} in {where}", "page": "1", "num_pages": "1",
+                                 "country": "ae", "date_posted": "week"}, timeout=40)
+        if r.status_code != 200:
+            DIAG[f"jsearch_http_{r.status_code}"] += 1
+            if DIAG[f"jsearch_http_{r.status_code}"] == 1:
+                print(f"  jsearch returned HTTP {r.status_code}: {r.text[:200]}")
+            return []
+        data = r.json().get("data") or []
+    except Exception as e:
+        print(f"  jsearch {country}/{kw}: {e}")
+        return []
+    DIAG["raw_jobs_from_jsearch"] += len(data)
+    out = []
+    for j in data:
+        out.append(dict(
+            company=(j.get("employer_name") or "").strip(), role=j.get("job_title") or "",
+            url=j.get("job_apply_link") or j.get("job_google_link") or "",
+            posted=parse_date(j.get("job_posted_at_datetime_utc")), country=country,
+            source="JSearch",
+            ptext=f"{j.get('job_employment_type') or ''} {(j.get('job_description') or '')[:600]}",
+            remote=bool(j.get("job_is_remote")), trusted=True))
+    return out
+
+
 # --------------------------- VERIFICATION -----------------------------------
 def job_is_live(url):
     """dead / live / unknown. Many job boards block bots, so 403 = unknown, not dead."""
@@ -242,7 +283,13 @@ def job_is_live(url):
 # blocked or that we could not check is DROPPED (set STRICT_VERIFY=0 to allow those).
 from collections import Counter
 DIAG = Counter()   # counts WHY jobs were dropped, printed at the end of every run
-STRICT = os.getenv("STRICT_VERIFY", "1") == "1"
+# VERIFY_MODE=fresh (default): if a job page is blocked by the site and cannot be opened,
+#   keep the company ONLY when the posting is at most FRESH_DAYS old, and say so in the file.
+# VERIFY_MODE=strict: drop everything whose page could not be opened.
+STRICT = os.getenv("VERIFY_MODE", "fresh") == "strict"
+FRESH_DAYS = int(os.getenv("FRESH_DAYS", "3"))
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")          # optional: JSearch (Google for Jobs listings)
+JSEARCH_PER_CITY = int(os.getenv("JSEARCH_PER_CITY", "3"))  # API calls per city per run (quota!)
 MAX_CHECK = int(os.getenv("MAX_CHECK", "600"))
 _status_cache = {}
 CLOSED_PHRASES = (
@@ -347,7 +394,7 @@ def load_history():
 
 
 def main():
-    if not (JOOBLE_KEY or (ADZUNA_ID and ADZUNA_KEY) or REED_KEY):
+    if not (JOOBLE_KEY or (ADZUNA_ID and ADZUNA_KEY) or REED_KEY or RAPIDAPI_KEY):
         sys.exit("No API keys set. Open README.md and add at least JOOBLE_KEY.")
 
     history = load_history()
@@ -384,6 +431,11 @@ def main():
                 pool[key]["sources"].add(j["source"])
                 pool[key]["remote"] = pool[key]["remote"] or j.get("remote", False)
                 pool[key]["project"] = pool[key].get("project") or j["project"]
+                if j["posted"] and (not pool[key]["posted"] or j["posted"] > pool[key]["posted"]):
+                    pool[key]["posted"] = j["posted"]      # keep the NEWEST posting date
+                if j.get("trusted") and not pool[key].get("trusted"):
+                    pool[key]["trusted"] = True            # listed on Google for Jobs = live
+                    pool[key]["url"] = j["url"]
             else:
                 pool[key] = dict(j, roles={j["role"]}, sources={j["source"]},
                                  remote=j.get("remote", False))
@@ -395,12 +447,16 @@ def main():
 
     if UAE_MODE:
         terms = list(KEYWORDS)  # no "remote" prefix, that pulls worldwide jobs into UAE
+        rot = datetime.now().timetuple().tm_yday % len(terms)   # different keywords first each day
+        terms = terms[rot:] + terms[:rot]
     for country, cfg in COUNTRIES.items():
         print(f"Collecting {country}...")
         if cfg.get("remotive"):
             ingest(country, from_remotive(country))
             continue
         for kw in terms:
+            if "jsearch" in cfg:
+                ingest(country, from_jsearch(country, cfg["jsearch"], kw))
             for page in range(1, PAGES + 1):
                 jobs = []
                 if "jooble" in cfg:
@@ -434,7 +490,9 @@ def main():
     while any(qs.values()) and len(order) < MAX_CHECK:
         for c in list(qs):
             if qs[c] and len(order) < MAX_CHECK:
-                order.append(qs[c].pop(0)["url"])
+                nxt = qs[c].pop(0)
+                if not nxt.get("trusted"):
+                    order.append(nxt["url"])
     print(f"Opening {len(order)} job pages to confirm they are still open...")
     with ThreadPoolExecutor(max_workers=10) as ex:
         list(ex.map(job_status, order))
@@ -448,17 +506,28 @@ def main():
             rec = queues[c].pop(0)
             if norm(rec["company"]) in used or rec["url"] in used_urls:
                 continue
-            live = job_status(rec["url"])
+            live = "trusted" if rec.get("trusted") else job_status(rec["url"])
             stats["checked"] += 1
             if live == "dead":
                 stats["closed"] += 1
                 continue
-            if live != "live" and STRICT:
-                stats["unverifiable"] += 1
-                continue
+            posted = rec["posted"]
+            age = (datetime.now(timezone.utc) - posted).days if posted else None
+            if live == "unknown":
+                # page blocked by the site. Fresh-mode: accept ONLY a known, very recent posting.
+                if STRICT or age is None or age > FRESH_DAYS:
+                    stats["unverifiable"] += 1
+                    continue
             stats["live"] += 1
-            verify = [f"job page opened on {datetime.now().strftime('%Y-%m-%d')}, no closed notice"
-                      if live == "live" else "job page could not be checked"]
+            if live == "live":
+                verify = [f"job page opened on {datetime.now().strftime('%Y-%m-%d')}, "
+                          f"no closed notice"]
+            elif live == "trusted":
+                verify = [f"live listing on Google for Jobs (JSearch), posted {age} day(s) ago"
+                          if age is not None else "live listing on Google for Jobs (JSearch)"]
+            else:
+                verify = [f"job page blocked by site, NOT opened. Posted {age} day(s) ago per "
+                          f"{'/'.join(sorted(rec['sources']))}. Check the link before pitching"]
             if c == "United Kingdom" and COMPANIES_HOUSE_KEY:
                 ok, txt = companies_house(rec["company"])
                 if not ok:
