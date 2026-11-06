@@ -138,7 +138,13 @@ def from_jooble(country, loc, kw, page):
     try:
         r = requests.post(f"https://jooble.org/api/{JOOBLE_KEY}",
                           json={"keywords": kw, "location": loc, "page": str(page)}, timeout=20)
+        DIAG["jooble_calls"] += 1
+        if r.status_code != 200:
+            DIAG[f"jooble_http_{r.status_code}"] += 1
+            if DIAG[f"jooble_http_{r.status_code}"] == 1:
+                print(f"  jooble returned HTTP {r.status_code}: {r.text[:200]}")
         jobs = r.json().get("jobs", [])
+        DIAG["raw_jobs_from_jooble"] += len(jobs)
     except Exception as e:
         print(f"  jooble {country}/{kw}: {e}")
         return []
@@ -234,6 +240,8 @@ def job_is_live(url):
 
 # STRICT = only keep a job if its page was actually opened and looks open. Anything the site
 # blocked or that we could not check is DROPPED (set STRICT_VERIFY=0 to allow those).
+from collections import Counter
+DIAG = Counter()   # counts WHY jobs were dropped, printed at the end of every run
 STRICT = os.getenv("STRICT_VERIFY", "1") == "1"
 MAX_CHECK = int(os.getenv("MAX_CHECK", "600"))
 _status_cache = {}
@@ -352,13 +360,22 @@ def main():
     def ingest(country, jobs):
         for j in jobs:
             n = norm(j["company"])
-            if not n or len(n) < 3 or n in seen_recent or is_recruiter(j["company"]):
+            if not n or len(n) < 3:
+                DIAG["dropped: no company name"] += 1
+                continue
+            if n in seen_recent:
+                DIAG["dropped: already given to you before"] += 1
+                continue
+            if is_recruiter(j["company"]):
+                DIAG["dropped: recruiter/agency"] += 1
                 continue
             if not fresh(j["posted"]):
+                DIAG[f"dropped: older than {MAX_AGE_DAYS} days"] += 1
                 continue
             if REMOTE_ONLY and not j.get("remote"):
                 continue
             if UAE_MODE and is_b2c(j["company"], j["role"]):
+                DIAG["dropped: consumer/non-B2B job"] += 1
                 continue
             j["project"] = is_project(j["role"], j.get("ptext"))
             key = (country, n)
@@ -464,8 +481,13 @@ def main():
             })
 
     if not results:
-        sys.exit("No NEW companies found today (everything returned was already given to you). "
-                 "Add more KEYWORDS or more API keys and run again.")
+        print("\nWHY NOTHING CAME OUT (send this block to Claude):")
+        for k, v in sorted(DIAG.items()):
+            print(f"   {k}: {v}")
+        vals = list(_status_cache.values())
+        print(f"   job pages opened: {len(vals)} | open: {vals.count('live')} | "
+              f"closed: {vals.count('dead')} | could not verify: {vals.count('unknown')}")
+        sys.exit("No companies passed all the checks today. See the numbers above.")
 
     # final safety net: no duplicate company can ever be written
     assert len({norm(r["Company"]) for r in results}) == len(results), "duplicate company!"
@@ -505,6 +527,7 @@ def main():
         counts[r["Country"]] = counts.get(r["Country"], 0) + 1
     print(f"\nDone. {len(results)} companies saved to {base}.xlsx")
     print("By country:", counts)
+    print("Where jobs were dropped:", dict(DIAG))
     vals = list(_status_cache.values())
     print(f"Job pages opened: {len(vals)} | open: {vals.count('live')} | "
           f"closed/expired/removed: {vals.count('dead')} | could not verify: {vals.count('unknown')} "
