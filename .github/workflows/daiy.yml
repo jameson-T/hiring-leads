@@ -20,7 +20,7 @@ jobs:
 
       - run: pip install requests openpyxl
 
-      - name: Generate today's companies
+      - name: Generate today's UAE B2B companies
         env:
           JOOBLE_KEY: ${{ secrets.JOOBLE_KEY }}
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
@@ -28,20 +28,22 @@ jobs:
           REED_KEY: ${{ secrets.REED_KEY }}
           COMPANIES_HOUSE_KEY: ${{ secrets.COMPANIES_HOUSE_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          KEYWORDS: "web designer,social media,marketing,developer,sales"
-          TARGET: "50"
+          UAE_MODE: "1"      # UAE only. Change to "0" to go back to all countries
+          TARGET: "60"
         run: python hiring_leads.py
 
       - name: Save results and history to the repo
         run: |
           git config user.name "hiring-bot"
           git config user.email "hiring-bot@users.noreply.github.com"
-          git add hiring_companies_*.xlsx hiring_companies_*.csv seen.json
-          git commit -m "Hiring leads $(date -u +%F)" || echo "nothing to commit"
+          git add -A
+          git commit -m "Leads $(date -u +%F)" || echo "nothing to commit"
           git pull --rebase
           git push
 
       - uses: actions/upload-artifact@v4
         with:
-          name: hiring-companies
-          path: hiring_companies_*.xlsx
+          name: leads
+          path: |
+            uae_b2b_*.xlsx
+            hiring_companies_*.xlsx
