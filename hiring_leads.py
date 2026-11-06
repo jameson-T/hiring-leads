@@ -16,7 +16,8 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote_plus, urlparse
 
 import requests
 
@@ -50,6 +51,32 @@ COUNTRIES = {
     # Remote-only job board, companies hiring worldwide (no API key needed)
     "Remote (Worldwide)": {"remotive": True},
 }
+
+# ---------------- UAE B2B MODE (UAE_MODE=1) ----------------
+# UAE only, split by city so the 60 companies come from a wide pool.
+UAE_MODE = os.getenv("UAE_MODE", "0") == "1"
+PREFIX = "uae_b2b" if UAE_MODE else "hiring_companies"
+if UAE_MODE:
+    if "MAX_AGE_DAYS" not in os.environ:
+        MAX_AGE_DAYS = 7   # UAE mode: only jobs from the last 7 days (set MAX_AGE_DAYS to change)
+    if "KEYWORDS" not in os.environ:
+        KEYWORDS = ["freelance", "contract", "project manager", "digital marketing",
+                    "web developer", "graphic designer", "social media", "seo",
+                    "video editor", "branding", "crm", "erp", "business development"]
+    COUNTRIES = {
+        "UAE - Dubai":     {"jooble": "Dubai"},
+        "UAE - Abu Dhabi": {"jooble": "Abu Dhabi"},
+        "UAE - Sharjah":   {"jooble": "Sharjah"},
+        "UAE - Other":     {"jooble": "United Arab Emirates"},
+    }
+
+# Obvious consumer-facing / non-B2B jobs get dropped in UAE mode
+B2C_WORDS = ("restaurant", "cafe", "café", "hotel", "salon", "barber", "driver", "cashier",
+             "waiter", "waitress", "barista", "chef", "cook", "nanny", "maid", "housekeeping",
+             "security guard", "supermarket", "hypermarket", "beautician", "nurse", "teacher",
+             "cleaner", "delivery rider", "storekeeper")
+PROJECT_WORDS = ("freelance", "contract", "project", "consultant", "consulting", "temporary",
+                 "short-term", "short term", "part-time", "part time", "per project")
 
 RECRUITER_WORDS = ("recruit", "staffing", "talent", "resourc", "headhunt", "personnel",
                    "manpower", "randstad", "adecco", "hays", "michael page", "robert half",
@@ -87,6 +114,16 @@ def is_recruiter(name):
     return EXCLUDE_RECRUITERS and any(w in low for w in RECRUITER_WORDS)
 
 
+def is_b2c(company, role):
+    blob = f"{company} {role}".lower()
+    return any(w in blob for w in B2C_WORDS)
+
+
+def is_project(*texts):
+    blob = " ".join(t for t in texts if t).lower()
+    return any(w in blob for w in PROJECT_WORDS)
+
+
 def is_remote(*texts):
     blob = " ".join(t for t in texts if t).lower()
     return any(w in blob for w in ("remote", "work from home", "work-from-home",
@@ -107,7 +144,7 @@ def from_jooble(country, loc, kw, page):
         return []
     return [dict(company=j.get("company", "").strip(), role=j.get("title", ""),
                  url=j.get("link", ""), posted=parse_date(j.get("updated")),
-                 country=country, source="Jooble",
+                 country=country, source="Jooble", ptext=j.get("snippet"),
                  remote=is_remote(j.get("title"), j.get("location"), j.get("snippet"))
                  ) for j in jobs]
 
@@ -195,6 +232,52 @@ def job_is_live(url):
         return "unknown"
 
 
+# STRICT = only keep a job if its page was actually opened and looks open. Anything the site
+# blocked or that we could not check is DROPPED (set STRICT_VERIFY=0 to allow those).
+STRICT = os.getenv("STRICT_VERIFY", "1") == "1"
+MAX_CHECK = int(os.getenv("MAX_CHECK", "600"))
+_status_cache = {}
+CLOSED_PHRASES = (
+    "no longer available", "no longer accepting", "no longer open", "has expired",
+    "job expired", "expired job", "position has been filled", "position is filled",
+    "vacancy has been filled", "this job is closed", "job is closed", "vacancy is closed",
+    "has been closed", "applications are closed", "applications closed", "job not found",
+    "this job has been removed", "job has been removed", "posting has been removed",
+    "this position is no longer", "this vacancy is no longer", "no longer active",
+    "page not found", "404 not found", "job no longer exists", "this job does not exist",
+    "offre n'est plus disponible", "offre expirée", "cette offre a expiré",
+    "n'est plus disponible", "stellenanzeige ist nicht mehr", "nicht mehr verfügbar",
+    "هذه الوظيفة لم تعد", "انتهت صلاحية",
+)
+
+
+def _check_job(url):
+    if not url:
+        return "unknown"
+    try:
+        r = requests.get(url, headers=UA, timeout=12, allow_redirects=True)
+    except Exception:
+        return "unknown"
+    if r.status_code in (404, 410):
+        return "dead"
+    if r.status_code >= 400:
+        return "unknown"            # blocked / error: cannot confirm
+    final, orig = urlparse(r.url), urlparse(url)
+    if final.path.strip("/") == "" and orig.path.strip("/") != "":
+        return "dead"               # bounced to a homepage = the job was removed
+    text = r.text[:400000].lower()
+    if any(p in text for p in CLOSED_PHRASES):
+        return "dead"
+    return "live"
+
+
+def job_status(url):
+    """live = page opens and shows no closed/expired notice. dead = gone/closed. unknown = could not check."""
+    if url not in _status_cache:
+        _status_cache[url] = _check_job(url)
+    return _status_cache[url]
+
+
 def companies_house(name):
     """Returns (found_active, text) for UK companies."""
     if not COMPANIES_HOUSE_KEY:
@@ -241,7 +324,9 @@ def load_history():
     except Exception:
         pass
     now = datetime.now(timezone.utc).isoformat()
-    for path in glob.glob(os.path.join(HERE, "hiring_companies_*.csv")):
+    paths = (glob.glob(os.path.join(HERE, "hiring_companies_*.csv")) +
+             glob.glob(os.path.join(HERE, "uae_b2b_*.csv")))
+    for path in paths:
         try:
             with open(path, newline="", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
@@ -273,11 +358,15 @@ def main():
                 continue
             if REMOTE_ONLY and not j.get("remote"):
                 continue
+            if UAE_MODE and is_b2c(j["company"], j["role"]):
+                continue
+            j["project"] = is_project(j["role"], j.get("ptext"))
             key = (country, n)
             if key in pool:
                 pool[key]["roles"].add(j["role"])
                 pool[key]["sources"].add(j["source"])
                 pool[key]["remote"] = pool[key]["remote"] or j.get("remote", False)
+                pool[key]["project"] = pool[key].get("project") or j["project"]
             else:
                 pool[key] = dict(j, roles={j["role"]}, sources={j["source"]},
                                  remote=j.get("remote", False))
@@ -287,6 +376,8 @@ def main():
     if REMOTE_ONLY:
         terms = [f"remote {k}" for k in KEYWORDS]
 
+    if UAE_MODE:
+        terms = list(KEYWORDS)  # no "remote" prefix, that pulls worldwide jobs into UAE
     for country, cfg in COUNTRIES.items():
         print(f"Collecting {country}...")
         if cfg.get("remotive"):
@@ -310,13 +401,26 @@ def main():
     for rec in pool.values():
         by_country.setdefault(rec["country"], []).append(rec)
     for lst in by_country.values():
-        # remote first, then seen on more boards, then newest
-        lst.sort(key=lambda r: (r["remote"], len(r["sources"]), r["posted"] or floor),
+        # NEWEST DAY FIRST. Within the same day: project/contract, then remote, then more boards.
+        # Jobs with no date go last.
+        lst.sort(key=lambda r: ((r["posted"] or floor).date(), r.get("project", False),
+                                r["remote"], len(r["sources"])),
                  reverse=True)
 
     results, queues = [], {c: list(v) for c, v in by_country.items()}
     used = set()  # a company can only appear once per file, even if it hires in several countries
     used_urls = set()
+    stats = {"checked": 0, "live": 0, "closed": 0, "unverifiable": 0}
+
+    # open the job pages in parallel (fast), in the same order we will use them
+    order, qs = [], {c: list(v) for c, v in queues.items()}
+    while any(qs.values()) and len(order) < MAX_CHECK:
+        for c in list(qs):
+            if qs[c] and len(order) < MAX_CHECK:
+                order.append(qs[c].pop(0)["url"])
+    print(f"Opening {len(order)} job pages to confirm they are still open...")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        list(ex.map(job_status, order))
     print(f"Pool: {sum(len(v) for v in queues.values())} candidate companies. Verifying...")
     while len(results) < TARGET and any(queues.values()):
         for c in list(queues):
@@ -327,10 +431,17 @@ def main():
             rec = queues[c].pop(0)
             if norm(rec["company"]) in used or rec["url"] in used_urls:
                 continue
-            live = job_is_live(rec["url"])
+            live = job_status(rec["url"])
+            stats["checked"] += 1
             if live == "dead":
+                stats["closed"] += 1
                 continue
-            verify = [f"job link {live}"]
+            if live != "live" and STRICT:
+                stats["unverifiable"] += 1
+                continue
+            stats["live"] += 1
+            verify = [f"job page opened on {datetime.now().strftime('%Y-%m-%d')}, no closed notice"
+                      if live == "live" else "job page could not be checked"]
             if c == "United Kingdom" and COMPANIES_HOUSE_KEY:
                 ok, txt = companies_house(rec["company"])
                 if not ok:
@@ -344,6 +455,7 @@ def main():
             results.append({
                 "Company": rec["company"], "Country": c,
                 "Remote?": "Yes" if rec["remote"] else "Not stated",
+                "Signal": "Contract / freelance / project" if rec.get("project") else "Direct hire",
                 "Roles hiring": " | ".join(sorted(rec["roles"]))[:200],
                 "Job link": rec["url"],
                 "Posted": rec["posted"].strftime("%Y-%m-%d") if rec["posted"] else "unknown",
@@ -362,7 +474,7 @@ def main():
               f"to get 40-60.")
 
     stamp = datetime.now().strftime("%Y-%m-%d")
-    base = os.path.join(HERE, f"hiring_companies_{stamp}")
+    base = os.path.join(HERE, f"{PREFIX}_{stamp}")
     fields = list(results[0].keys())
     with open(base + ".csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -376,7 +488,7 @@ def main():
         ws.append(fields)
         for r in results:
             ws.append([r[k] for k in fields])
-        for col, width in zip("ABCDEFGHI", (30, 18, 12, 45, 50, 12, 55, 30, 45)):
+        for col, width in zip("ABCDEFGHIJ", (30, 18, 12, 28, 45, 50, 12, 55, 30, 45)):
             ws.column_dimensions[col].width = width
         wb.save(base + ".xlsx")
     except ImportError:
@@ -393,6 +505,10 @@ def main():
         counts[r["Country"]] = counts.get(r["Country"], 0) + 1
     print(f"\nDone. {len(results)} companies saved to {base}.xlsx")
     print("By country:", counts)
+    vals = list(_status_cache.values())
+    print(f"Job pages opened: {len(vals)} | open: {vals.count('live')} | "
+          f"closed/expired/removed: {vals.count('dead')} | could not verify: {vals.count('unknown')} "
+          f"| {len(results)} confirmed-open companies sent to you")
 
 
 if __name__ == "__main__":
