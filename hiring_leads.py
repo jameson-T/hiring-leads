@@ -178,6 +178,9 @@ def from_jooble(country, loc, kw, page):
                 print(f"  jooble returned HTTP {r.status_code}: {r.text[:200]}")
         jobs = r.json().get("jobs", [])
         DIAG["raw_jobs_from_jooble"] += len(jobs)
+        if DIAG["jooble_calls"] <= 6:   # show what Jooble really answers, for the first few calls
+            print(f"  jooble sample #{DIAG['jooble_calls']}: location={loc!r} keyword={kw!r} "
+                  f"page={page} -> {len(jobs)} jobs (Jooble says total: {r.json().get('totalCount')})")
     except Exception as e:
         print(f"  jooble {country}/{kw}: {e}")
         return []
@@ -501,6 +504,8 @@ def main():
                     jobs += from_reed(country, kw, page)
                 ingest(country, jobs)
                 time.sleep(0.3)
+                if not jobs:
+                    break          # empty page = no more results for this search
 
     # round-robin across countries so one country doesn't eat the whole list
     by_country = {}
